@@ -1,0 +1,12 @@
+streamlit>=1.28
+opencv-python-headless>=4.8
+numpy>=1.24
+pillow>=10.0
+pytesseract>=0.3.10
+pyzbar>=0.1.9
+deepface>=0.0.89
+tf-keras>=2.15
+
+# System dependency (install separately, not via pip):
+#   Tesseract OCR    — https://github.com/tesseract-ocr/tesseract
+#   libzbar0 (Linux) — apt-get install libzbar0 / brew install zbar (macOS)

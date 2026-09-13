@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+verification_ledger.json
+*.jpg
+*.jpeg
+*.png
+!docs/**
+.DS_Store
+.streamlit/secrets.toml

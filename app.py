@@ -4,19 +4,38 @@ app.py
 AI-Based Fake Identity & Document Screening System
 Smart India Hackathon - Cybersecurity & Blockchain track
 
-Pipeline: Upload -> OCR -> Forgery/Authenticity Screening -> Live Selfie
-          -> Face Match -> Blockchain Ledger Record -> Final Report
+Two distinct use cases, chosen up front, because they don't need the same
+steps:
+
+  DOCUMENT-ONLY SCREENING
+    "Is this specific document image fake/tampered?" - no live person
+    needed. Upload -> OCR -> Forensic Screening -> Final Report.
+
+  FULL IDENTITY VERIFICATION
+    "Does the person in front of the camera match this document, and is
+    the document itself genuine?" - the KYC/onboarding scenario, where
+    a live selfie makes sense because the document holder IS the one
+    using the app. Upload -> OCR -> Forensic Screening -> Live Selfie
+    -> Face Match -> Final Report.
+
+Both modes end by recording the outcome to the blockchain-style ledger.
 
 All processing is local. Uploaded images are written to a per-session
 temp directory and deleted at the end of the session - no document image
 or selfie is ever persisted to disk long-term or sent anywhere. Only a
 SHA-256 hash of the document (not the image itself) is written to the
 verification ledger.
+
+SCOPE NOTE (say this out loud in any demo): forensic screening here checks
+whether ONE uploaded image is internally consistent - not whether the
+document is a real UIDAI record. A well-fabricated document with a
+checksum-valid-looking number and no visible splice can still score
+moderately. See forgery_detection.py's module docstring for the full
+explanation of what each check can and can't tell you.
 """
 
 import os
 import tempfile
-import shutil
 
 import streamlit as st
 
@@ -96,6 +115,16 @@ section[data-testid="stSidebar"] { background: var(--panel); border-right: 1px s
 .verdict-banner h2 { margin: 0 0 4px 0; font-size: 22px; }
 .verdict-banner p { margin: 0; color: var(--muted); font-size: 14px; }
 
+.mode-card {
+    background: var(--panel);
+    border: 1px solid var(--panel-line);
+    border-radius: 6px;
+    padding: 22px 24px;
+    margin-bottom: 14px;
+}
+.mode-card h3 { margin: 0 0 6px 0; font-size: 17px; }
+.mode-card p { color: var(--muted); font-size: 13.5px; margin: 0 0 4px 0; }
+
 .stButton>button {
     background: var(--accent); color: #0B1220; border: none; font-weight: 600;
     border-radius: 4px; padding: 8px 18px;
@@ -104,21 +133,43 @@ section[data-testid="stSidebar"] { background: var(--panel); border-right: 1px s
 </style>
 """
 
-STEPS = ["Upload Document", "Text Extraction", "Forensic Screening", "Live Selfie", "Face Match", "Final Report"]
+RESET_KEYS = ("doc_path", "selfie_path", "ocr_result", "doc_type", "forgery_report", "face_result", "ledger_block")
 
 
 def init_session():
     if "step" not in st.session_state:
         st.session_state.step = 0
+    if "mode" not in st.session_state:
+        st.session_state.mode = None  # "document_only" | "full"
     if "workdir" not in st.session_state:
         st.session_state.workdir = tempfile.mkdtemp(prefix="docscreen_")
     if "ledger" not in st.session_state:
         st.session_state.ledger = VerificationLedger(
             os.path.join(st.session_state.workdir, "..", "verification_ledger.json")
         )
-    for key in ("doc_path", "selfie_path", "ocr_result", "doc_type", "forgery_report", "face_result"):
+    for key in RESET_KEYS:
         if key not in st.session_state:
             st.session_state[key] = None
+
+
+def steps_for_mode():
+    """The ordered list of step functions for the current mode. Index in
+    this list IS st.session_state.step - keep the two in sync."""
+    if st.session_state.mode == "document_only":
+        return [step_mode, step_upload, step_ocr, step_forgery, step_report]
+    elif st.session_state.mode == "full":
+        return [step_mode, step_upload, step_ocr, step_forgery, step_selfie, step_face_match, step_report]
+    else:
+        return [step_mode]
+
+
+def sidebar_labels():
+    if st.session_state.mode == "document_only":
+        return ["Choose Mode", "Upload Document", "Text Extraction", "Forensic Screening", "Final Report"]
+    elif st.session_state.mode == "full":
+        return ["Choose Mode", "Upload Document", "Text Extraction", "Forensic Screening", "Live Selfie", "Face Match", "Final Report"]
+    else:
+        return ["Choose Mode"]
 
 
 def render_sidebar():
@@ -131,16 +182,13 @@ def render_sidebar():
         """,
         unsafe_allow_html=True,
     )
-    for i, label in enumerate(STEPS):
+    for i, label in enumerate(sidebar_labels()):
         if i < st.session_state.step:
-            cls = "done"
-            marker = "✓"
+            cls, marker = "done", "✓"
         elif i == st.session_state.step:
-            cls = "active"
-            marker = "›"
+            cls, marker = "active", "›"
         else:
-            cls = "pending"
-            marker = "·"
+            cls, marker = "pending", "·"
         st.sidebar.markdown(f'<div class="step-item {cls}">{marker}  {label}</div>', unsafe_allow_html=True)
 
     st.sidebar.markdown("<div style='margin-top:24px;'></div>", unsafe_allow_html=True)
@@ -153,7 +201,9 @@ def render_sidebar():
     )
 
 
-def page_header(eyebrow: str, title: str, subtitle: str):
+def page_header(title: str, subtitle: str):
+    total = len(sidebar_labels())
+    eyebrow = f"STEP {st.session_state.step + 1} / {total}"
     st.markdown(
         f"""
         <div class="page-header">
@@ -174,24 +224,66 @@ def save_upload(uploaded_file, dest_name: str) -> str:
     return path
 
 
+def advance():
+    st.session_state.step += 1
+    st.rerun()
+
+
 # ---------------------------------------------------------------------------
 # Step screens
 # ---------------------------------------------------------------------------
 
+def step_mode():
+    page_header("What do you want to do?",
+                "These need different steps, so pick the one that matches your situation.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown(
+            """
+            <div class="mode-card">
+                <h3>📄 Screen a document</h3>
+                <p>You have a document image and want to check if it's fake or tampered —
+                no live person needed. E.g. reviewing a submitted ID as an institution.</p>
+                <p>Steps: Upload → OCR → Forensic Screening → Report</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Screen a document only →", key="mode_doc"):
+            st.session_state.mode = "document_only"
+            advance()
+    with col2:
+        st.markdown(
+            """
+            <div class="mode-card">
+                <h3>🪪 Full identity verification</h3>
+                <p>You (the document holder) are here to prove your own identity —
+                the app will also compare your live selfie against the document photo.
+                E.g. onboarding / KYC.</p>
+                <p>Steps: Upload → OCR → Forensic Screening → Selfie → Face Match → Report</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Full identity verification →", key="mode_full"):
+            st.session_state.mode = "full"
+            advance()
+
+
 def step_upload():
-    page_header("STEP 1 / 6", "Upload identity document",
+    page_header("Upload identity document",
                 "Aadhaar, PAN, Driving Licence, or Passport. Use a clear, well-lit photo — avoid screenshots where possible.")
     uploaded = st.file_uploader("Document image", type=["jpg", "jpeg", "png"], label_visibility="collapsed")
     if uploaded:
         st.image(uploaded, width=360)
         if st.button("Continue to text extraction →"):
             st.session_state.doc_path = save_upload(uploaded, "document")
-            st.session_state.step = 1
-            st.rerun()
+            advance()
 
 
 def step_ocr():
-    page_header("STEP 2 / 6", "Text extraction",
+    page_header("Text extraction",
                 "OCR reads the printed fields off the document so they can be cross-checked in the next step.")
     with st.spinner("Running OCR..."):
         result = extract_fields(st.session_state.doc_path)
@@ -218,13 +310,12 @@ def step_ocr():
             st.markdown(f'<div class="field-row"><span class="k">{k}</span><span class="v">{v}</span></div>', unsafe_allow_html=True)
 
     if st.button("Continue to forensic screening →"):
-        st.session_state.step = 2
-        st.rerun()
+        advance()
 
 
 def step_forgery():
-    page_header("STEP 3 / 6", "Forensic authenticity screening",
-                "QR cross-verification, compression-error analysis, duplicated-region detection, and metadata forensics.")
+    page_header("Forensic authenticity screening",
+                "QR cross-verification, Aadhaar checksum validation, compression-error analysis, duplicated-region detection, and metadata forensics.")
 
     with st.spinner("Running forensic checks..."):
         detector = DocumentForgeryDetector()
@@ -236,7 +327,7 @@ def step_forgery():
         f"""
         <div class="verdict-banner {verdict_class}">
             <h2>{report.verdict} — {report.authenticity_score:.0f}/100</h2>
-            <p>Composite score from 4 independent forensic checks, weighted by reliability.</p>
+            <p>Composite score from {len(report.checks)} independent forensic checks, weighted by reliability.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -259,24 +350,45 @@ def step_forgery():
     if report.authenticity_score < 40:
         st.error("Document failed forensic screening. Proceeding is not recommended — flag for manual review.")
 
-    if st.button("Continue to live selfie →"):
-        st.session_state.step = 3
-        st.rerun()
+    # Duplicate-submission check - this is the blockchain ledger earning its
+    # keep beyond just tamper-evidence: if this EXACT document image has
+    # been verified before, that's a real fraud signal (a stolen/leaked ID
+    # photo being reused across multiple verification attempts).
+    prior_records = st.session_state.ledger.lookup_document(st.session_state.doc_path)
+    st.session_state.prior_verifications = prior_records
+    if prior_records:
+        import datetime
+        lines = []
+        for rec in prior_records:
+            ts = datetime.datetime.fromtimestamp(rec["timestamp"]).strftime("%d %b %Y, %H:%M")
+            lines.append(f"• Block #{rec['index']} — {ts} — verdict: {rec['data']['authenticity_verdict']}")
+        st.warning(
+            f"⚠ **This exact document has already been verified {len(prior_records)} time(s) before**, "
+            f"per the ledger:\n\n" + "\n".join(lines) +
+            "\n\nA legitimate document shouldn't be verified repeatedly through separate applications. "
+            "This warrants manual review before proceeding."
+        )
+
+    st.caption("Note: these checks confirm this image is internally consistent (not visibly edited) — "
+               "they don't confirm the document is a real UIDAI/government record.")
+
+    next_label = "Continue to final report →" if st.session_state.mode == "document_only" else "Continue to live selfie →"
+    if st.button(next_label):
+        advance()
 
 
 def step_selfie():
-    page_header("STEP 4 / 6", "Live selfie capture",
+    page_header("Live selfie capture",
                 "Used only to compare against the face on the document. Deleted at the end of this session.")
     photo = st.camera_input("Take a selfie", label_visibility="collapsed")
     if photo:
         if st.button("Continue to face match →"):
             st.session_state.selfie_path = save_upload(photo, "selfie")
-            st.session_state.step = 4
-            st.rerun()
+            advance()
 
 
 def step_face_match():
-    page_header("STEP 5 / 6", "Face match",
+    page_header("Face match",
                 "Comparing the face on the document against the live selfie.")
     with st.spinner("Matching faces..."):
         result = match_faces(st.session_state.doc_path, st.session_state.selfie_path, sensitivity="balanced")
@@ -298,18 +410,30 @@ def step_face_match():
         )
 
     if st.button("Continue to final report →"):
-        st.session_state.step = 5
-        st.rerun()
+        advance()
 
 
 def step_report():
-    page_header("STEP 6 / 6", "Final report & blockchain record",
+    page_header("Final report & blockchain record",
                 "Combined outcome, recorded to the tamper-evident verification ledger.")
 
     report = st.session_state.forgery_report
-    face = st.session_state.face_result
+    face = st.session_state.face_result  # None in document_only mode
 
-    combined_ok = report.authenticity_score >= 50 and (face.matched if not face.error else False)
+    if face is not None and not face.error:
+        combined_ok = report.authenticity_score >= 50 and face.matched
+        face_line = f"Face match {'passed' if face.matched else 'failed'} ({face.confidence:.0f}% confidence)"
+    elif face is not None and face.error:
+        combined_ok = False
+        face_line = f"Face match could not be completed: {face.error}"
+    else:
+        combined_ok = report.authenticity_score >= 50
+        face_line = "Face match not applicable — document-only screening"
+
+    prior_count = len(st.session_state.get("prior_verifications") or [])
+    if prior_count > 0:
+        combined_ok = False  # duplicate submission overrides an otherwise-clean result
+
     overall_class = "genuine" if combined_ok else "fake"
     overall_label = "VERIFIED" if combined_ok else "NOT VERIFIED"
 
@@ -317,20 +441,23 @@ def step_report():
         f"""
         <div class="verdict-banner {overall_class}">
             <h2>{overall_label}</h2>
-            <p>Authenticity score {report.authenticity_score:.0f}/100 · Face match {"passed" if (not face.error and face.matched) else "failed"}</p>
+            <p>Authenticity score {report.authenticity_score:.0f}/100 · {face_line}</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    if "ledger_block" not in st.session_state or st.session_state.ledger_block is None:
+    if prior_count > 0:
+        st.warning(f"⚠ This document was already verified {prior_count} time(s) before this session — see the ledger block below for prior records.")
+
+    if st.session_state.ledger_block is None:
         block = st.session_state.ledger.add_verification_record(
             document_path=st.session_state.doc_path,
             document_type=st.session_state.doc_type,
             authenticity_score=report.authenticity_score,
             authenticity_verdict=report.verdict,
-            face_match_score=face.confidence if not face.error else None,
-            face_match_passed=face.matched if not face.error else None,
+            face_match_score=(face.confidence if (face is not None and not face.error) else None),
+            face_match_passed=(face.matched if (face is not None and not face.error) else None),
         )
         st.session_state.ledger_block = block
 
@@ -354,8 +481,9 @@ def step_report():
         st.error(f"Ledger integrity check FAILED at block {broken_at}. Records may have been tampered with.")
 
     if st.button("Start new verification"):
-        for key in ("doc_path", "selfie_path", "ocr_result", "doc_type", "forgery_report", "face_result", "ledger_block"):
+        for key in RESET_KEYS:
             st.session_state[key] = None
+        st.session_state.mode = None
         st.session_state.step = 0
         st.rerun()
 
@@ -369,7 +497,11 @@ def main():
     init_session()
     render_sidebar()
 
-    steps = [step_upload, step_ocr, step_forgery, step_selfie, step_face_match, step_report]
+    steps = steps_for_mode()
+    # Guard against a stale step index (e.g. after switching mode) pointing
+    # past the end of the current mode's step list.
+    if st.session_state.step >= len(steps):
+        st.session_state.step = len(steps) - 1
     steps[st.session_state.step]()
 
 

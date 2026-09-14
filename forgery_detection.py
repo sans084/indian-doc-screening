@@ -7,11 +7,21 @@ Designed to plug into the existing Indian-Document-Verification-System
 (Streamlit + DeepFace + Tesseract) as an additional screening layer that
 runs BEFORE / ALONGSIDE the face-match step.
 
-Four independent signals are combined into a single authenticity score:
+Five independent signals are combined into a single authenticity score:
   1. QR cross-verification   (Aadhaar secure QR vs OCR text)
-  2. Error Level Analysis     (JPEG recompression artifact detection)
-  3. Copy-move detection      (duplicated-region detection via ORB)
-  4. Metadata / EXIF forensics (screenshot / editor fingerprints)
+  2. Aadhaar checksum validation (Verhoeff algorithm - catches fabricated numbers)
+  3. Error Level Analysis     (JPEG recompression artifact detection)
+  4. Copy-move detection      (duplicated-region detection via ORB)
+  5. Metadata / EXIF forensics (screenshot / editor fingerprints)
+
+IMPORTANT SCOPE NOTE: every check here evaluates whether ONE uploaded image
+is internally consistent (unedited, structurally valid) - none of them
+confirm the document is registered with UIDAI or belongs to a real person.
+A wholly fabricated document that is internally consistent (correct
+checksum math, no visible splice, clean compression) can still score high
+here. This module answers "was this specific image tampered with", not
+"is this a real government record" - the latter requires UIDAI API access
+this project does not have. Say this plainly in any demo/judging context.
 
 Usage:
     from forgery_detection import DocumentForgeryDetector
@@ -101,9 +111,10 @@ class DocumentForgeryDetector:
 
     # Relative importance of each check in the final blended score.
     WEIGHTS = {
-        "qr_cross_check": 0.35,
-        "error_level_analysis": 0.30,
-        "copy_move_detection": 0.20,
+        "qr_cross_check": 0.25,
+        "aadhaar_checksum": 0.20,
+        "error_level_analysis": 0.25,
+        "copy_move_detection": 0.15,
         "metadata_forensics": 0.15,
     }
 
@@ -124,6 +135,7 @@ class DocumentForgeryDetector:
         """
         checks = [
             self._check_qr_cross_verification(image_path, ocr_text),
+            self._check_aadhaar_checksum(ocr_text),
             self._check_error_level_analysis(image_path),
             self._check_copy_move(image_path),
             self._check_metadata(image_path),
@@ -157,8 +169,17 @@ class DocumentForgeryDetector:
 
         decoded = zbar_decode(img)
         if not decoded:
-            # Not all ID types have a QR code (e.g. older Aadhaar, PAN, DL).
-            # Absence isn't itself proof of forgery, so score neutrally.
+            # Not all ID types have a QR code (e.g. PAN, DL, older pre-2018
+            # Aadhaar prints), so absence alone isn't proof of forgery.
+            # But if the OCR text looks distinctly Aadhaar-shaped (12-digit
+            # UID number pattern present), a missing QR is more suspicious -
+            # every Aadhaar issued since 2018 carries a secure QR code.
+            looks_like_aadhaar = bool(ocr_text and re.search(r"\d{4}\s?\d{4}\s?\d{4}", ocr_text))
+            if looks_like_aadhaar:
+                return CheckResult(name, False, 35, weight,
+                                    "No QR code found, but the document text matches an Aadhaar number pattern. "
+                                    "Genuine Aadhaar cards issued since 2018 always carry a secure QR code - "
+                                    "its absence here is a meaningful red flag, not just a scan-quality issue.")
             return CheckResult(name, True, 65, weight,
                                 "No QR code found - document type may not carry one, or image quality is too low to decode.")
 
@@ -224,7 +245,79 @@ class DocumentForgeryDetector:
                                 f"Strong indicator the visible text was edited after the QR was generated.",
                                 evidence={"qr_payload_preview": qr_payload[:150]})
 
-    # -- check 2: Error Level Analysis -----------------------------------
+    # -- check 2: Aadhaar number checksum (Verhoeff algorithm) --------------
+
+    # Standard Verhoeff algorithm tables - the same checksum scheme UIDAI
+    # uses for the 12th digit of every Aadhaar number. A fabricated number
+    # (made up for a joke/fake image) has roughly a 90% chance of failing
+    # this check outright, since it's not just "12 digits" - the digits
+    # have to satisfy this specific multiplication/permutation relationship.
+    _D_TABLE = [
+        [0,1,2,3,4,5,6,7,8,9],[1,2,3,4,0,6,7,8,9,5],[2,3,4,0,1,7,8,9,5,6],
+        [3,4,0,1,2,8,9,5,6,7],[4,0,1,2,3,9,5,6,7,8],[5,9,8,7,6,0,4,3,2,1],
+        [6,5,9,8,7,1,0,4,3,2],[7,6,5,9,8,2,1,0,4,3],[8,7,6,5,9,3,2,1,0,4],
+        [9,8,7,6,5,4,3,2,1,0],
+    ]
+    _P_TABLE = [
+        [0,1,2,3,4,5,6,7,8,9],[1,5,7,6,2,8,3,0,9,4],[5,8,0,3,7,9,6,1,4,2],
+        [8,9,1,6,0,4,3,5,2,7],[9,4,5,3,1,2,6,8,7,0],[4,2,8,6,5,7,3,9,0,1],
+        [2,7,9,3,8,0,6,4,1,5],[7,0,4,6,9,1,3,2,5,8],
+    ]
+
+    @classmethod
+    def _verhoeff_validate(cls, number_str: str) -> bool:
+        c = 0
+        for i, digit in enumerate(reversed(number_str)):
+            c = cls._D_TABLE[c][cls._P_TABLE[i % 8][int(digit)]]
+        return c == 0
+
+    def _check_aadhaar_checksum(self, ocr_text: Optional[str]) -> CheckResult:
+        name = "Aadhaar Checksum Validation"
+        weight = self.WEIGHTS["aadhaar_checksum"]
+
+        if not ocr_text:
+            return CheckResult(name, True, 60, weight, "No OCR text supplied - checksum check skipped.")
+
+        candidates = re.findall(r"(?<![\d-])\d{4}\s?\d{4}\s?\d{4}(?!\d)", ocr_text)
+        if not candidates:
+            return CheckResult(name, True, 60, weight,
+                                "No 12-digit Aadhaar-format number found in the extracted text - "
+                                "check not applicable to this document type.")
+
+        # UIDAI never issues Aadhaar numbers starting with 0 or 1.
+        results = []
+        for raw in candidates:
+            digits = raw.replace(" ", "")
+            if len(digits) != 12:
+                continue
+            starts_valid = digits[0] not in ("0", "1")
+            checksum_valid = self._verhoeff_validate(digits)
+            results.append((digits, starts_valid, checksum_valid))
+
+        if not results:
+            return CheckResult(name, True, 60, weight, "No valid-length candidate number to check.")
+
+        # Use the first candidate found (OCR of Aadhaar cards typically only
+        # has one 12-digit number - the UID itself).
+        digits, starts_valid, checksum_valid = results[0]
+
+        if starts_valid and checksum_valid:
+            return CheckResult(name, True, 95, weight,
+                                f"Number {digits[:4]} {digits[4:8]} {digits[8:]} passes the Verhoeff checksum "
+                                f"UIDAI uses for Aadhaar numbers. Strong structural authenticity signal.",
+                                evidence={"checked_number_masked": f"{digits[:4]} XXXX {digits[8:]}"})
+        else:
+            reason = []
+            if not starts_valid:
+                reason.append("starts with 0/1, which UIDAI never issues")
+            if not checksum_valid:
+                reason.append("fails the Verhoeff checksum UIDAI uses for every Aadhaar number")
+            return CheckResult(name, False, 8, weight,
+                                f"Number {digits[:4]} {digits[4:8]} {digits[8:]} {' and '.join(reason)}. "
+                                f"This is a strong indicator the number was fabricated rather than issued by UIDAI.",
+                                evidence={"checked_number_masked": f"{digits[:4]} XXXX {digits[8:]}"})
+
+    # -- check 3: Error Level Analysis -----------------------------------
 
     def _check_error_level_analysis(self, image_path: str) -> CheckResult:
         name = "Error Level Analysis"
